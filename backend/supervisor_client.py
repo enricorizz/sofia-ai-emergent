@@ -1,5 +1,5 @@
 """
-Supervisor client for managing the clawdbot gateway process.
+Supervisor client for managing the openclaw gateway process.
 
 This module provides a clean interface for starting, stopping, and
 checking the status of the gateway process managed by supervisord.
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class SupervisorClient:
     """Client for interacting with supervisord to manage the gateway process."""
 
-    PROGRAM = "clawdbot-gateway"
+    PROGRAM = "openclaw-gateway"
 
     @classmethod
     def start(cls) -> bool:
@@ -35,7 +35,9 @@ class SupervisorClient:
                 logger.info(f"Started {cls.PROGRAM} via supervisor")
                 return True
             else:
-                logger.error(f"Failed to start {cls.PROGRAM}: {result.stderr}")
+                # supervisorctl reports errors on stdout, not stderr
+                error_msg = result.stdout.strip() or result.stderr.strip() or "(no output)"
+                logger.error(f"Failed to start {cls.PROGRAM}: {error_msg}")
                 return False
         except subprocess.TimeoutExpired:
             logger.error(f"Timeout starting {cls.PROGRAM}")
@@ -88,7 +90,7 @@ class SupervisorClient:
                 timeout=10
             )
             # Check for RUNNING state in output
-            # Output format: "clawdbot-gateway            RUNNING   pid 12345, uptime 0:01:23"
+            # Output format: "openclaw-gateway            RUNNING   pid 12345, uptime 0:01:23"
             return 'RUNNING' in result.stdout
         except Exception as e:
             logger.error(f"Error checking {cls.PROGRAM} status: {e}")
@@ -109,7 +111,7 @@ class SupervisorClient:
                 text=True,
                 timeout=10
             )
-            # Parse PID from output like: "clawdbot-gateway            RUNNING   pid 12345, uptime 0:01:23"
+            # Parse PID from output like: "openclaw-gateway            RUNNING   pid 12345, uptime 0:01:23"
             if 'RUNNING' in result.stdout and 'pid' in result.stdout:
                 # Extract pid number
                 parts = result.stdout.split('pid')

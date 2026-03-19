@@ -6,7 +6,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CREDS_FILE = Path.home() / ".clawdbot/credentials/whatsapp/default/creds.json"
+CREDS_FILE = Path.home() / ".openclaw/credentials/whatsapp/default/creds.json"
 
 def fix_registered_flag() -> bool:
     """Fix Baileys registered=false bug. Returns True if fix applied."""

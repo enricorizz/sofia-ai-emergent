@@ -42,8 +42,8 @@ api_router = APIRouter(prefix="/api")
 # Moltbot Gateway Management
 MOLTBOT_PORT = 18789
 MOLTBOT_CONTROL_PORT = 18791
-CONFIG_DIR = os.path.expanduser("~/.clawdbot")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "clawdbot.json")
+CONFIG_DIR = os.path.expanduser("~/.openclaw")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "openclaw.json")
 WORKSPACE_DIR = os.path.expanduser("~/clawd")
 
 # Global state for gateway (per-user)
@@ -117,6 +117,37 @@ EMERGENT_AUTH_URL = "https://demobackend.emergentagent.com/auth/v1/env/oauth/ses
 SESSION_EXPIRY_DAYS = 7
 
 
+async def get_instance_owner() -> Optional[dict]:
+    """Get the instance owner from database. Returns None if not locked yet."""
+    doc = await db.instance_config.find_one({"_id": "instance_owner"})
+    return doc
+
+
+async def set_instance_owner(user: User) -> None:
+    """Lock the instance to a specific user. Only succeeds if not already locked."""
+    await db.instance_config.update_one(
+        {"_id": "instance_owner"},
+        {
+            "$setOnInsert": {
+                "user_id": user.user_id,
+                "email": user.email,
+                "name": user.name,
+                "locked_at": datetime.now(timezone.utc)
+            }
+        },
+        upsert=True
+    )
+
+
+async def check_instance_access(user: User) -> bool:
+    """Check if user is allowed to access this instance. Returns True if allowed."""
+    owner = await get_instance_owner()
+    if not owner:
+        # Instance not locked yet - anyone can access
+        return True
+    return owner.get("user_id") == user.user_id
+
+
 async def get_current_user(request: Request) -> Optional[User]:
     """
     Get current user from session token.
@@ -169,20 +200,41 @@ async def get_current_user(request: Request) -> Optional[User]:
 
 
 async def require_auth(request: Request) -> User:
-    """Dependency that requires authentication"""
+    """Dependency that requires authentication and instance access"""
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    # Check if user is allowed to access this instance
+    if not await check_instance_access(user):
+        owner = await get_instance_owner()
+        raise HTTPException(
+            status_code=403, 
+            detail=f"This instance is locked to {owner.get('email', 'another user')}. Access denied."
+        )
     return user
 
 
 # ============== Auth Endpoints ==============
+
+@api_router.get("/auth/instance")
+async def get_instance_status():
+    """
+    Check if the instance is locked.
+    Public endpoint - only returns locked status, no owner details.
+    """
+    owner = await get_instance_owner()
+    if owner:
+        return {"locked": True}
+    return {"locked": False}
+
 
 @api_router.post("/auth/session")
 async def create_session(request: SessionRequest, response: Response):
     """
     Exchange session_id from Emergent Auth for a session token.
     Creates user if not exists, creates session, sets cookie.
+    Blocks non-owners if instance is locked.
     """
     try:
         # Call Emergent Auth to get user data
@@ -201,10 +253,18 @@ async def create_session(request: SessionRequest, response: Response):
         email = auth_data.get("email")
         name = auth_data.get("name", email.split("@")[0] if email else "User")
         picture = auth_data.get("picture")
-        emergent_session_token = auth_data.get("session_token")
 
         if not email:
             raise HTTPException(status_code=400, detail="No email in auth response")
+
+        # Check if instance is locked to another user
+        owner = await get_instance_owner()
+        if owner and owner.get("email") != email:
+            logger.warning(f"Blocked login attempt from {email} - instance locked to {owner.get('email')}")
+            raise HTTPException(
+                status_code=403,
+                detail=f"This instance is private and locked to {owner.get('email')}. Access denied."
+            )
 
         # Check if user exists
         existing_user = await db.users.find_one({"email": email}, {"_id": 0})
@@ -293,26 +353,30 @@ async def logout(request: Request, response: Response):
 
 # ============== Moltbot Helpers ==============
 
-# Persistent paths for Node.js and clawdbot
+# Persistent paths for Node.js and openclaw
 NODE_DIR = "/root/nodejs"
-CLAWDBOT_DIR = "/root/.clawdbot-bin"
-CLAWDBOT_WRAPPER = "/root/run_clawdbot.sh"
+OPENCLAW_DIR = "/root/.openclaw-bin"
+OPENCLAW_WRAPPER = "/root/run_openclaw.sh"
 
-def get_clawdbot_command():
-    """Get the path to clawdbot executable"""
+def get_openclaw_command():
+    """Get the path to openclaw executable"""
     # Try wrapper script first
-    if os.path.exists(CLAWDBOT_WRAPPER):
-        return CLAWDBOT_WRAPPER
+    if os.path.exists(OPENCLAW_WRAPPER):
+        return OPENCLAW_WRAPPER
     # Try persistent location
-    if os.path.exists(f"{CLAWDBOT_DIR}/clawdbot"):
-        return f"{CLAWDBOT_DIR}/clawdbot"
-    if os.path.exists(f"{NODE_DIR}/bin/clawdbot"):
-        return f"{NODE_DIR}/bin/clawdbot"
+    if os.path.exists(f"{OPENCLAW_DIR}/openclaw"):
+        return f"{OPENCLAW_DIR}/openclaw"
+    if os.path.exists(f"{NODE_DIR}/bin/openclaw"):
+        return f"{NODE_DIR}/bin/openclaw"
+    # Try well-known system locations
+    for p in ["/usr/local/bin/openclaw", "/usr/bin/openclaw"]:
+        if os.path.exists(p):
+            return p
     # Try system path
     import shutil
-    clawdbot_path = shutil.which("clawdbot")
-    if clawdbot_path:
-        return clawdbot_path
+    openclaw_path = shutil.which("openclaw")
+    if openclaw_path:
+        return openclaw_path
     return None
 
 
@@ -320,21 +384,21 @@ def ensure_moltbot_installed():
     """Ensure Moltbot dependencies are installed"""
     install_script = "/app/backend/install_moltbot_deps.sh"
 
-    # Check if clawdbot is available
-    clawdbot_cmd = get_clawdbot_command()
-    if clawdbot_cmd:
-        logger.info(f"Clawdbot found at: {clawdbot_cmd}")
+    # Check if openclaw is available
+    openclaw_cmd = get_openclaw_command()
+    if openclaw_cmd:
+        logger.info(f"OpenClaw found at: {openclaw_cmd}")
         return True
 
     # Run installation script if available
     if os.path.exists(install_script):
-        logger.info("Clawdbot not found, running installation script...")
+        logger.info("OpenClaw not found, running installation script...")
         try:
             result = subprocess.run(
                 ["bash", install_script],
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=600
             )
             if result.returncode == 0:
                 logger.info("Moltbot dependencies installed successfully")
@@ -346,7 +410,7 @@ def ensure_moltbot_installed():
             logger.error(f"Installation script error: {e}")
             return False
 
-    logger.error("Clawdbot not found and no installation script available")
+    logger.error("OpenClaw not found and no installation script available")
     return False
 
 
@@ -356,7 +420,7 @@ def generate_token():
 
 
 def create_moltbot_config(token: str = None, api_key: str = None, provider: str = "emergent", force_new_token: bool = False):
-    """Update clawdbot.json with gateway config and provider settings
+    """Update openclaw.json with gateway config and provider settings
 
     Args:
         token: Optional token. If not provided, reuses existing or generates new.
@@ -461,16 +525,16 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
             "authHeader": True,
             "models": [
                 {
-                    "id": "claude-sonnet-4-5",
-                    "name": "Claude Sonnet 4.5",
+                    "id": "claude-sonnet-4-6",
+                    "name": "Claude Sonnet 4.6",
                     "input": ["text"],
                     "cost": {"input": 0.000003, "output": 0.000015, "cacheRead": 0.0000003, "cacheWrite": 0.00000375},
                     "contextWindow": 200000,
                     "maxTokens": 64000
                 },
                 {
-                    "id": "claude-opus-4-5",
-                    "name": "Claude Opus 4.5",
+                    "id": "claude-opus-4-6",
+                    "name": "Claude Opus 4.6",
                     "input": ["text"],
                     "cost": {"input": 0.000005, "output": 0.000025, "cacheRead": 0.0000005, "cacheWrite": 0.00000625},
                     "contextWindow": 200000,
@@ -485,10 +549,11 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         # Set primary model to Claude Sonnet
         existing_config["agents"]["defaults"]["models"] = {
             "emergent-gpt/gpt-5.2": {"alias": "gpt-5.2"},
-            "emergent-claude/claude-sonnet-4-5": {"alias": "sonnet"}
+            "emergent-claude/claude-sonnet-4-6": {"alias": "sonnet"},
+            "emergent-claude/claude-opus-4-6": {"alias": "opus"}
         }
         existing_config["agents"]["defaults"]["model"] = {
-            "primary": "emergent-claude/claude-sonnet-4-5"
+            "primary": "emergent-claude/claude-opus-4-6"
         }
 
     elif provider == "openai":
@@ -628,14 +693,14 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str)
 
         return token
 
-    # Ensure clawdbot is installed
-    clawdbot_cmd = get_clawdbot_command()
-    if not clawdbot_cmd:
+    # Ensure openclaw is installed
+    openclaw_cmd = get_openclaw_command()
+    if not openclaw_cmd:
         if not ensure_moltbot_installed():
-            raise HTTPException(status_code=500, detail="OpenClaw (clawdbot) is not installed. Please contact support.")
-        clawdbot_cmd = get_clawdbot_command()
-        if not clawdbot_cmd:
-            raise HTTPException(status_code=500, detail="Failed to find clawdbot after installation")
+            raise HTTPException(status_code=500, detail="OpenClaw is not installed. Please contact support.")
+        openclaw_cmd = get_openclaw_command()
+        if not openclaw_cmd:
+            raise HTTPException(status_code=500, detail="Failed to find openclaw after installation")
 
     # Create config (reuses existing token to avoid gateway restarts)
     token = create_moltbot_config(api_key=api_key, provider=provider)
@@ -656,7 +721,7 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str)
     gateway_state["owner_user_id"] = owner_user_id
 
     # Wait for gateway to be ready
-    max_wait = 30
+    max_wait = 120
     start_time = asyncio.get_event_loop().time()
 
     async with httpx.AsyncClient() as http_client:
@@ -664,7 +729,8 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str)
             try:
                 response = await http_client.get(f"http://127.0.0.1:{MOLTBOT_PORT}/", timeout=2.0)
                 if response.status_code == 200:
-                    logger.info("Moltbot gateway is ready!")
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    logger.info(f"OpenClaw gateway is ready! (took {elapsed:.1f}s)")
 
                     # Store config in database for persistence (with should_run flag)
                     await db.moltbot_configs.update_one(
@@ -719,7 +785,7 @@ async def start_moltbot(request: OpenClawStartRequest, req: Request):
         raise HTTPException(status_code=400, detail="API key required for anthropic/openai providers")
 
     # Check if Moltbot is already running by another user
-    if check_gateway_running() and gateway_state["owner_user_id"] != user.user_id:
+    if check_gateway_running() and gateway_state["owner_user_id"] is not None and gateway_state["owner_user_id"] != user.user_id:
         raise HTTPException(
             status_code=403,
             detail="OpenClaw is already running by another user. Please wait for them to stop it."
@@ -727,6 +793,10 @@ async def start_moltbot(request: OpenClawStartRequest, req: Request):
 
     try:
         token = await start_gateway_process(request.apiKey, request.provider, user.user_id)
+
+        # Lock the instance to this user on first successful start
+        await set_instance_owner(user)
+        logger.info(f"Instance locked to user: {user.email}")
 
         return OpenClawStartResponse(
             ok=True,
@@ -748,7 +818,7 @@ async def get_moltbot_status(request: Request):
     running = check_gateway_running()
 
     if running:
-        is_owner = user and gateway_state["owner_user_id"] == user.user_id
+        is_owner = user and (gateway_state["owner_user_id"] is None or gateway_state["owner_user_id"] == user.user_id)
         return OpenClawStatusResponse(
             running=True,
             pid=SupervisorClient.get_pid(),
@@ -784,7 +854,7 @@ async def stop_moltbot(request: Request):
         return {"ok": True, "message": "OpenClaw is not running"}
 
     # Check if user is the owner
-    if gateway_state["owner_user_id"] != user.user_id:
+    if gateway_state["owner_user_id"] is not None and gateway_state["owner_user_id"] != user.user_id:
         raise HTTPException(status_code=403, detail="Only the owner can stop OpenClaw")
 
     # Stop via supervisor
@@ -818,7 +888,7 @@ async def get_moltbot_token(request: Request):
         raise HTTPException(status_code=404, detail="OpenClaw not running")
 
     # Only owner can get the token
-    if gateway_state["owner_user_id"] != user.user_id:
+    if gateway_state["owner_user_id"] is not None and gateway_state["owner_user_id"] != user.user_id:
         raise HTTPException(status_code=403, detail="Only the owner can access the token")
 
     return {"token": gateway_state.get("token")}
@@ -838,7 +908,7 @@ async def proxy_moltbot_ui(request: Request, path: str = ""):
         )
 
     # Check if user is the owner
-    if not user or gateway_state["owner_user_id"] != user.user_id:
+    if not user or (gateway_state["owner_user_id"] is not None and gateway_state["owner_user_id"] != user.user_id):
         return HTMLResponse(
             content="<html><body><h1>Access Denied</h1><p>This OpenClaw instance is owned by another user.</p><a href='/'>Go back</a></body></html>",
             status_code=403
@@ -990,7 +1060,8 @@ async def websocket_proxy(websocket: WebSocket):
             ping_interval=20,
             ping_timeout=20,
             close_timeout=10,
-            additional_headers=extra_headers if extra_headers else None
+            additional_headers=extra_headers if extra_headers else None,
+            origin=f"http://127.0.0.1:{MOLTBOT_PORT}"
         ) as moltbot_ws:
 
             async def client_to_moltbot():
@@ -1098,10 +1169,58 @@ async def whatsapp_auto_fix_watcher():
                 logger.info("[whatsapp-watcher] DETECTED registered=false, applying fix...")
                 if fix_registered_flag():
                     logger.info("[whatsapp-watcher] Fix applied, restarting gateway via supervisor...")
-                    result = subprocess.run(["supervisorctl", "restart", "clawdbot-gateway"], capture_output=True, text=True)
+                    result = subprocess.run(["supervisorctl", "restart", "openclaw-gateway"], capture_output=True, text=True)
                     logger.info(f"[whatsapp-watcher] Supervisor restart result: {result.stdout} {result.stderr}")
         except Exception as e:
             logger.warning(f"[whatsapp-watcher] Error: {e}")
+
+
+async def _deferred_gateway_starter(config_doc):
+    """Background task: retry gateway auto-start after transfer_files populates config."""
+    for i in range(60):  # 5 minutes at 5s intervals
+        await asyncio.sleep(5)
+        # Double-start guard: if gateway was started by another path (e.g. user API call), exit
+        if SupervisorClient.status():
+            logger.info("[deferred-start] Gateway already running, exiting deferred starter")
+            return
+        if not os.path.exists(CONFIG_FILE):
+            if i % 12 == 11:  # Log every 60s
+                logger.info(f"[deferred-start] Still waiting for config file ({(i+1)*5}s elapsed)")
+            continue
+        logger.info("[deferred-start] Config file detected, attempting gateway start...")
+        # Ensure openclaw binary is available (non-blocking)
+        openclaw_cmd = get_openclaw_command()
+        if not openclaw_cmd:
+            try:
+                await asyncio.to_thread(ensure_moltbot_installed)
+            except Exception as e:
+                logger.error(f"[deferred-start] Failed to install OpenClaw: {e}")
+                return
+            openclaw_cmd = get_openclaw_command()
+        if not openclaw_cmd:
+            logger.error("[deferred-start] Cannot start gateway: OpenClaw not available after install")
+            return
+        # Read token from config file or database
+        token = config_doc.get("token")
+        if not token:
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                token = config.get("gateway", {}).get("auth", {}).get("token")
+            except Exception:
+                token = generate_token()
+        # Write env file and start
+        write_gateway_env(token=token, provider=config_doc.get("provider", "emergent"))
+        if SupervisorClient.start():
+            logger.info("[deferred-start] Gateway auto-start succeeded")
+            gateway_state["token"] = token
+            gateway_state["provider"] = config_doc.get("provider", "emergent")
+            gateway_state["owner_user_id"] = config_doc.get("owner_user_id")
+            gateway_state["started_at"] = config_doc.get("started_at")
+        else:
+            logger.error("[deferred-start] Gateway auto-start failed via supervisor")
+        return
+    logger.warning("[deferred-start] Config file never appeared after 5 minutes, giving up")
 
 
 @app.on_event("startup")
@@ -1115,9 +1234,9 @@ async def startup_event():
     SupervisorClient.reload_config()
 
     # Check and install Moltbot dependencies if needed
-    clawdbot_cmd = get_clawdbot_command()
-    if clawdbot_cmd:
-        logger.info(f"Moltbot dependencies ready: {clawdbot_cmd}")
+    openclaw_cmd = get_openclaw_command()
+    if openclaw_cmd:
+        logger.info(f"Moltbot dependencies ready: {openclaw_cmd}")
     else:
         logger.info("Moltbot dependencies not found, will install on first use")
 
@@ -1157,32 +1276,46 @@ async def startup_event():
         # Gateway should be running but isn't - auto-start it!
         logger.info("Gateway should_run=True but not running - auto-starting via supervisor...")
 
-        # Recover token from config file or database
-        token = config_doc.get("token")
-        if not token:
-            try:
-                with open(CONFIG_FILE, 'r') as f:
-                    config = json.load(f)
-                token = config.get("gateway", {}).get("auth", {}).get("token")
-            except:
-                token = generate_token()
-
-        # Write env file for supervisor wrapper
-        write_gateway_env(token=token, provider=config_doc.get("provider", "emergent"))
-
-        # Start via supervisor
-        if SupervisorClient.start():
-            logger.info("Gateway auto-started successfully via supervisor")
-
-            # Wait briefly for it to be ready
-            await asyncio.sleep(3)
-
-            gateway_state["token"] = token
-            gateway_state["provider"] = config_doc.get("provider", "emergent")
-            gateway_state["owner_user_id"] = config_doc.get("owner_user_id")
-            gateway_state["started_at"] = config_doc.get("started_at")
+        # Check if config directory has content (may still be pending transfer on StatefulSet pods)
+        if not os.path.exists(CONFIG_FILE):
+            logger.info(f"Config file {CONFIG_FILE} not found yet - deferring auto-start (transfer may be pending)")
+            asyncio.create_task(_deferred_gateway_starter(config_doc))
         else:
-            logger.error("Failed to auto-start gateway via supervisor")
+            # Ensure openclaw binary is available before starting
+            if not openclaw_cmd:
+                logger.info("OpenClaw binary not found, installing before auto-start...")
+                ensure_moltbot_installed()
+                openclaw_cmd = get_openclaw_command()
+
+            if not openclaw_cmd:
+                logger.error("Cannot auto-start gateway: OpenClaw binary not available after install attempt")
+            else:
+                # Recover token from config file or database
+                token = config_doc.get("token")
+                if not token:
+                    try:
+                        with open(CONFIG_FILE, 'r') as f:
+                            config = json.load(f)
+                        token = config.get("gateway", {}).get("auth", {}).get("token")
+                    except:
+                        token = generate_token()
+
+                # Write env file for supervisor wrapper
+                write_gateway_env(token=token, provider=config_doc.get("provider", "emergent"))
+
+                # Start via supervisor
+                if SupervisorClient.start():
+                    logger.info("Gateway auto-started successfully via supervisor")
+
+                    # Wait briefly for it to be ready
+                    await asyncio.sleep(3)
+
+                    gateway_state["token"] = token
+                    gateway_state["provider"] = config_doc.get("provider", "emergent")
+                    gateway_state["owner_user_id"] = config_doc.get("owner_user_id")
+                    gateway_state["started_at"] = config_doc.get("started_at")
+                else:
+                    logger.error("Failed to auto-start gateway via supervisor")
 
     # Start WhatsApp auto-fix background watcher
     whatsapp_watcher_task = asyncio.create_task(whatsapp_auto_fix_watcher())

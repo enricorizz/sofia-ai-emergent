@@ -1,13 +1,13 @@
 #!/bin/bash
 # Moltbot Dependencies Installation Script
-# Installs Node.js and clawdbot to /root for persistence across restarts
+# Installs Node.js and openclaw to /root for persistence across restarts
 
 set -e
 
 LOGFILE="/tmp/moltbot_deps.log"
 LOCKFILE="/tmp/moltbot_deps.lock"
 NODE_DIR="/root/nodejs"
-CLAWDBOT_DIR="/root/.clawdbot-bin"
+OPENCLAW_DIR="/root/.openclaw-bin"
 NODE_VERSION="22.22.0"
 
 log() {
@@ -26,7 +26,7 @@ touch "$LOCKFILE"
 log "Starting Moltbot dependencies check..."
 
 # Ensure PATH includes our custom directories
-export PATH="$NODE_DIR/bin:$CLAWDBOT_DIR:$PATH"
+export PATH="$NODE_DIR/bin:$OPENCLAW_DIR:$PATH"
 
 # Add to .bashrc if not already there
 if ! grep -q "NODE_DIR=/root/nodejs" /root/.bashrc 2>/dev/null; then
@@ -34,8 +34,8 @@ if ! grep -q "NODE_DIR=/root/nodejs" /root/.bashrc 2>/dev/null; then
 
 # Moltbot dependencies paths
 export NODE_DIR=/root/nodejs
-export CLAWDBOT_DIR=/root/.clawdbot-bin
-export PATH="$NODE_DIR/bin:$CLAWDBOT_DIR:$PATH"
+export OPENCLAW_DIR=/root/.openclaw-bin
+export PATH="$NODE_DIR/bin:$OPENCLAW_DIR:$PATH"
 EOF
     log "Added paths to .bashrc"
 fi
@@ -78,30 +78,30 @@ fi
 # Update PATH for npm operations
 export PATH="$NODE_DIR/bin:$PATH"
 
-# Check if clawdbot is installed in persistent location
-if [ -f "$CLAWDBOT_DIR/clawdbot" ]; then
-    log "Clawdbot found at $CLAWDBOT_DIR: $("$CLAWDBOT_DIR/clawdbot" --version 2>/dev/null || echo 'unknown')"
+# Check if openclaw is installed in persistent location
+if [ -f "$OPENCLAW_DIR/openclaw" ]; then
+    log "OpenClaw found at $OPENCLAW_DIR: $("$OPENCLAW_DIR/openclaw" --version 2>/dev/null || echo 'unknown')"
 else
-    log "Clawdbot not found in $CLAWDBOT_DIR. Installing..."
+    log "OpenClaw not found in $OPENCLAW_DIR. Installing..."
     
-    mkdir -p "$CLAWDBOT_DIR"
+    mkdir -p "$OPENCLAW_DIR"
     
-    # Install clawdbot globally using our Node.js
-    log "Installing clawdbot via npm..."
-    "$NODE_DIR/bin/npm" install -g clawdbot@latest 2>&1 | tee -a "$LOGFILE" || true
+    # Install openclaw globally using our Node.js
+    log "Installing openclaw via npm..."
+    "$NODE_DIR/bin/npm" install -g openclaw@latest 2>&1 | tee -a "$LOGFILE" || true
     
     # The npm global bin is in $NODE_DIR/bin, create symlink
-    if [ -f "$NODE_DIR/bin/clawdbot" ]; then
-        ln -sf "$NODE_DIR/bin/clawdbot" "$CLAWDBOT_DIR/clawdbot"
-        log "Clawdbot symlinked to $CLAWDBOT_DIR"
+    if [ -f "$NODE_DIR/bin/openclaw" ]; then
+        ln -sf "$NODE_DIR/bin/openclaw" "$OPENCLAW_DIR/openclaw"
+        log "OpenClaw symlinked to $OPENCLAW_DIR"
     fi
     
     # Verify
-    if [ -f "$CLAWDBOT_DIR/clawdbot" ] || [ -f "$NODE_DIR/bin/clawdbot" ]; then
-        VERSION=$("$NODE_DIR/bin/clawdbot" --version 2>/dev/null || echo 'installed')
-        log "Clawdbot installed: $VERSION"
+    if [ -f "$OPENCLAW_DIR/openclaw" ] || [ -f "$NODE_DIR/bin/openclaw" ]; then
+        VERSION=$("$NODE_DIR/bin/openclaw" --version 2>/dev/null || echo 'installed')
+        log "OpenClaw installed: $VERSION"
     else
-        log "WARNING: Clawdbot installation may have issues, trying alternative method..."
+        log "WARNING: OpenClaw installation may have issues, trying alternative method..."
         # Try using the installer script but capture the binary
         curl -fsSL https://molt.bot/install.sh -o /tmp/install_moltbot.sh
         chmod +x /tmp/install_moltbot.sh
@@ -110,36 +110,36 @@ else
         bash /tmp/install_moltbot.sh || true
         
         # Copy to our persistent location if it exists
-        if [ -f "/usr/bin/clawdbot" ]; then
-            cp /usr/bin/clawdbot "$CLAWDBOT_DIR/clawdbot"
-            chmod +x "$CLAWDBOT_DIR/clawdbot"
-            log "Clawdbot copied to persistent location"
+        if [ -f "/usr/bin/openclaw" ]; then
+            cp /usr/bin/openclaw "$OPENCLAW_DIR/openclaw"
+            chmod +x "$OPENCLAW_DIR/openclaw"
+            log "OpenClaw copied to persistent location"
         fi
     fi
 fi
 
 # Create a wrapper script that the backend can use
-cat > /root/run_clawdbot.sh << 'WRAPPER'
+cat > /root/run_openclaw.sh << 'WRAPPER'
 #!/bin/bash
 export NODE_DIR=/root/nodejs
-export CLAWDBOT_DIR=/root/.clawdbot-bin
-export PATH="$NODE_DIR/bin:$CLAWDBOT_DIR:$PATH"
+export OPENCLAW_DIR=/root/.openclaw-bin
+export PATH="$NODE_DIR/bin:$OPENCLAW_DIR:$PATH"
 
-# Find clawdbot
-if [ -f "$CLAWDBOT_DIR/clawdbot" ]; then
-    exec "$CLAWDBOT_DIR/clawdbot" "$@"
-elif [ -f "$NODE_DIR/bin/clawdbot" ]; then
-    exec "$NODE_DIR/bin/clawdbot" "$@"
-elif command -v clawdbot &> /dev/null; then
-    exec clawdbot "$@"
+# Find openclaw
+if [ -f "$OPENCLAW_DIR/openclaw" ]; then
+    exec "$OPENCLAW_DIR/openclaw" "$@"
+elif [ -f "$NODE_DIR/bin/openclaw" ]; then
+    exec "$NODE_DIR/bin/openclaw" "$@"
+elif command -v openclaw &> /dev/null; then
+    exec openclaw "$@"
 else
-    echo "ERROR: clawdbot not found" >&2
+    echo "ERROR: openclaw not found" >&2
     exit 1
 fi
 WRAPPER
-chmod +x /root/run_clawdbot.sh
+chmod +x /root/run_openclaw.sh
 
-log "Created wrapper script at /root/run_clawdbot.sh"
+log "Created wrapper script at /root/run_openclaw.sh"
 log "Moltbot dependencies check complete!"
 
 # Print final status
@@ -147,6 +147,6 @@ echo ""
 echo "=== Installation Summary ==="
 echo "Node.js: $("$NODE_DIR/bin/node" -v 2>/dev/null || echo 'not found')"
 echo "npm: $("$NODE_DIR/bin/npm" -v 2>/dev/null || echo 'not found')"
-echo "clawdbot: $(/root/run_clawdbot.sh --version 2>/dev/null || echo 'not found')"
+echo "openclaw: $(/root/run_openclaw.sh --version 2>/dev/null || echo 'not found')"
 echo "Paths added to /root/.bashrc"
 echo ""
