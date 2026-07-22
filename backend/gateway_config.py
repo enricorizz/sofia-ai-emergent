@@ -45,7 +45,7 @@ def write_gateway_env(token: str, api_key: str = None, provider: str = "emergent
     # Write the file
     content = "\n".join(lines) + "\n"
 
-    with open(GATEWAY_ENV_FILE, 'w') as f:
+    with open(GATEWAY_ENV_FILE, "w") as f:
         f.write(content)
 
     # Set secure permissions (readable only by owner)

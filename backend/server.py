@@ -1,40 +1,72 @@
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
-from fastapi.responses import HTMLResponse
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from starlette.websockets import WebSocketState
-from motor.motor_asyncio import AsyncIOMotorClient
-import os
-import logging
+import asyncio
 import json
+import logging
+import os
 import secrets
 import subprocess
-import asyncio
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import List, Optional
+
 import httpx
 import websockets
+from dotenv import load_dotenv
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import HTMLResponse
+
+# Gateway management (supervisor-based)
+from gateway_config import clear_gateway_env, write_gateway_env
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, ConfigDict, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketState
+from supervisor_client import SupervisorClient
 from websockets.exceptions import ConnectionClosed
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
-import uuid
-from datetime import datetime, timezone, timedelta
 
 # WhatsApp monitoring
-from whatsapp_monitor import get_whatsapp_status, fix_registered_flag
-# Gateway management (supervisor-based)
-from gateway_config import write_gateway_env, clear_gateway_env
-from supervisor_client import SupervisorClient
+from whatsapp_monitor import fix_registered_flag, get_whatsapp_status
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
+mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get('DB_NAME', 'moltbot_app')]
+db = client[os.environ.get("DB_NAME", "moltbot_app")]
+
+# Rate limiter (in-memory, per remote IP)
+limiter = Limiter(key_func=get_remote_address)
+
+
+@asynccontextmanager
+async def lifespan(application):  # noqa: ARG001
+    """Startup / shutdown handler (modern replacement for on_event).
+    startup_event and shutdown_db_client are defined lower in this file;
+    Python resolves them at call-time so the forward reference is safe.
+    """
+    await startup_event()  # type: ignore[name-defined]
+    yield
+    await shutdown_db_client()  # type: ignore[name-defined]
+
 
 # Create the main app without a prefix
-app = FastAPI()
+app = FastAPI(title="Sofia AI – OpenClaw Hosting API", version="1.0.0", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -52,18 +84,20 @@ gateway_state = {
     "token": None,
     "provider": None,
     "started_at": None,
-    "owner_user_id": None  # Track which user owns this instance
+    "owner_user_id": None,  # Track which user owns this instance
 }
 
 # Configure logging
+_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=getattr(logging, _log_level, logging.INFO),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
 # ============== Pydantic Models ==============
+
 
 class StatusCheck(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -132,10 +166,10 @@ async def set_instance_owner(user: User) -> None:
                 "user_id": user.user_id,
                 "email": user.email,
                 "name": user.name,
-                "locked_at": datetime.now(timezone.utc)
+                "locked_at": datetime.now(timezone.utc),
             }
         },
-        upsert=True
+        upsert=True,
     )
 
 
@@ -169,10 +203,7 @@ async def get_current_user(request: Request) -> Optional[User]:
         return None
 
     # Look up session in database
-    session_doc = await db.user_sessions.find_one(
-        {"session_token": session_token},
-        {"_id": 0}
-    )
+    session_doc = await db.user_sessions.find_one({"session_token": session_token}, {"_id": 0})
 
     if not session_doc:
         return None
@@ -188,10 +219,7 @@ async def get_current_user(request: Request) -> Optional[User]:
         return None
 
     # Get user
-    user_doc = await db.users.find_one(
-        {"user_id": session_doc["user_id"]},
-        {"_id": 0}
-    )
+    user_doc = await db.users.find_one({"user_id": session_doc["user_id"]}, {"_id": 0})
 
     if not user_doc:
         return None
@@ -204,18 +232,19 @@ async def require_auth(request: Request) -> User:
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
+
     # Check if user is allowed to access this instance
     if not await check_instance_access(user):
         owner = await get_instance_owner()
         raise HTTPException(
-            status_code=403, 
-            detail=f"This instance is locked to {owner.get('email', 'another user')}. Access denied."
+            status_code=403,
+            detail=f"This instance is locked to {owner.get('email', 'another user')}. Access denied.",
         )
     return user
 
 
 # ============== Auth Endpoints ==============
+
 
 @api_router.get("/auth/instance")
 async def get_instance_status():
@@ -230,7 +259,8 @@ async def get_instance_status():
 
 
 @api_router.post("/auth/session")
-async def create_session(request: SessionRequest, response: Response):
+@limiter.limit("10/minute")
+async def create_session(request: Request, body: SessionRequest, response: Response):
     """
     Exchange session_id from Emergent Auth for a session token.
     Creates user if not exists, creates session, sets cookie.
@@ -240,9 +270,7 @@ async def create_session(request: SessionRequest, response: Response):
         # Call Emergent Auth to get user data
         async with httpx.AsyncClient() as client:
             auth_response = await client.get(
-                EMERGENT_AUTH_URL,
-                headers={"X-Session-ID": request.session_id},
-                timeout=10.0
+                EMERGENT_AUTH_URL, headers={"X-Session-ID": body.session_id}, timeout=10.0
             )
 
         if auth_response.status_code != 200:
@@ -260,10 +288,12 @@ async def create_session(request: SessionRequest, response: Response):
         # Check if instance is locked to another user
         owner = await get_instance_owner()
         if owner and owner.get("email") != email:
-            logger.warning(f"Blocked login attempt from {email} - instance locked to {owner.get('email')}")
+            logger.warning(
+                f"Blocked login attempt from {email} - instance locked to {owner.get('email')}"
+            )
             raise HTTPException(
                 status_code=403,
-                detail=f"This instance is private and locked to {owner.get('email')}. Access denied."
+                detail=f"This instance is private and locked to {owner.get('email')}. Access denied.",
             )
 
         # Check if user exists
@@ -273,30 +303,33 @@ async def create_session(request: SessionRequest, response: Response):
             user_id = existing_user["user_id"]
             # Update user info
             await db.users.update_one(
-                {"user_id": user_id},
-                {"$set": {"name": name, "picture": picture}}
+                {"user_id": user_id}, {"$set": {"name": name, "picture": picture}}
             )
         else:
             # Create new user
             user_id = f"user_{uuid.uuid4().hex[:12]}"
-            await db.users.insert_one({
-                "user_id": user_id,
-                "email": email,
-                "name": name,
-                "picture": picture,
-                "created_at": datetime.now(timezone.utc)
-            })
+            await db.users.insert_one(
+                {
+                    "user_id": user_id,
+                    "email": email,
+                    "name": name,
+                    "picture": picture,
+                    "created_at": datetime.now(timezone.utc),
+                }
+            )
 
         # Create session
         session_token = secrets.token_hex(32)
         expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_EXPIRY_DAYS)
 
-        await db.user_sessions.insert_one({
-            "user_id": user_id,
-            "session_token": session_token,
-            "expires_at": expires_at,
-            "created_at": datetime.now(timezone.utc)
-        })
+        await db.user_sessions.insert_one(
+            {
+                "user_id": user_id,
+                "session_token": session_token,
+                "expires_at": expires_at,
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
 
         # Set cookie
         response.set_cookie(
@@ -306,16 +339,13 @@ async def create_session(request: SessionRequest, response: Response):
             secure=True,
             samesite="none",
             path="/",
-            max_age=SESSION_EXPIRY_DAYS * 24 * 60 * 60
+            max_age=SESSION_EXPIRY_DAYS * 24 * 60 * 60,
         )
 
         # Get user data
         user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
 
-        return {
-            "ok": True,
-            "user": user_doc
-        }
+        return {"ok": True, "user": user_doc}
 
     except HTTPException:
         raise
@@ -341,12 +371,7 @@ async def logout(request: Request, response: Response):
     if session_token:
         await db.user_sessions.delete_one({"session_token": session_token})
 
-    response.delete_cookie(
-        key="session_token",
-        path="/",
-        secure=True,
-        samesite="none"
-    )
+    response.delete_cookie(key="session_token", path="/", secure=True, samesite="none")
 
     return {"ok": True, "message": "Logged out"}
 
@@ -357,6 +382,7 @@ async def logout(request: Request, response: Response):
 NODE_DIR = "/root/nodejs"
 OPENCLAW_DIR = "/root/.openclaw-bin"
 OPENCLAW_WRAPPER = "/root/run_openclaw.sh"
+
 
 def get_openclaw_command():
     """Get the path to openclaw executable"""
@@ -374,6 +400,7 @@ def get_openclaw_command():
             return p
     # Try system path
     import shutil
+
     openclaw_path = shutil.which("openclaw")
     if openclaw_path:
         return openclaw_path
@@ -395,10 +422,7 @@ def ensure_moltbot_installed():
         logger.info("OpenClaw not found, running installation script...")
         try:
             result = subprocess.run(
-                ["bash", install_script],
-                capture_output=True,
-                text=True,
-                timeout=600
+                ["bash", install_script], capture_output=True, text=True, timeout=600
             )
             if result.returncode == 0:
                 logger.info("Moltbot dependencies installed successfully")
@@ -419,7 +443,12 @@ def generate_token():
     return secrets.token_hex(32)
 
 
-def create_moltbot_config(token: str = None, api_key: str = None, provider: str = "emergent", force_new_token: bool = False):
+def create_moltbot_config(
+    token: str = None,
+    api_key: str = None,
+    provider: str = "emergent",
+    force_new_token: bool = False,
+):
     """Update openclaw.json with gateway config and provider settings
 
     Args:
@@ -454,21 +483,17 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
     # Use existing token, provided token, or generate new
     final_token = existing_token or token or generate_token()
 
-    logger.info(f"Config token: {'reusing existing' if existing_token else 'new token'}, provider: {provider}")
+    logger.info(
+        f"Config token: {'reusing existing' if existing_token else 'new token'}, provider: {provider}"
+    )
 
     # Gateway config to merge
     gateway_config = {
         "mode": "local",
         "port": MOLTBOT_PORT,
         "bind": "lan",
-        "auth": {
-            "mode": "token",
-            "token": final_token
-        },
-        "controlUi": {
-            "enabled": True,
-            "allowInsecureAuth": True
-        }
+        "auth": {"mode": "token", "token": final_token},
+        "controlUi": {"enabled": True, "allowInsecureAuth": True},
     }
 
     # Merge config - preserve existing settings, update gateway
@@ -491,8 +516,10 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
     # Configure providers based on selection
     if provider == "emergent":
         # Use Emergent's proxy for both GPT and Claude
-        emergent_key = api_key or os.environ.get('EMERGENT_API_KEY', 'sk-emergent-1234')
-        emergent_base_url = os.environ.get('EMERGENT_BASE_URL', 'https://integrations.emergentagent.com/llm')
+        emergent_key = api_key or os.environ.get("EMERGENT_API_KEY", "sk-emergent-1234")
+        emergent_base_url = os.environ.get(
+            "EMERGENT_BASE_URL", "https://integrations.emergentagent.com/llm"
+        )
 
         # Emergent GPT provider (openai-completions API)
         emergent_gpt_provider = {
@@ -509,12 +536,12 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
                         "input": 0.00000175,
                         "output": 0.000014,
                         "cacheRead": 0.000000175,
-                        "cacheWrite": 0.00000175
+                        "cacheWrite": 0.00000175,
                     },
                     "contextWindow": 400000,
-                    "maxTokens": 128000
+                    "maxTokens": 128000,
                 }
-            ]
+            ],
         }
 
         # Emergent Claude provider (anthropic-messages API with authHeader)
@@ -528,19 +555,29 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
                     "id": "claude-sonnet-4-6",
                     "name": "Claude Sonnet 4.6",
                     "input": ["text"],
-                    "cost": {"input": 0.000003, "output": 0.000015, "cacheRead": 0.0000003, "cacheWrite": 0.00000375},
+                    "cost": {
+                        "input": 0.000003,
+                        "output": 0.000015,
+                        "cacheRead": 0.0000003,
+                        "cacheWrite": 0.00000375,
+                    },
                     "contextWindow": 200000,
-                    "maxTokens": 64000
+                    "maxTokens": 64000,
                 },
                 {
                     "id": "claude-opus-4-6",
                     "name": "Claude Opus 4.6",
                     "input": ["text"],
-                    "cost": {"input": 0.000005, "output": 0.000025, "cacheRead": 0.0000005, "cacheWrite": 0.00000625},
+                    "cost": {
+                        "input": 0.000005,
+                        "output": 0.000025,
+                        "cacheRead": 0.0000005,
+                        "cacheWrite": 0.00000625,
+                    },
                     "contextWindow": 200000,
-                    "maxTokens": 64000
-                }
-            ]
+                    "maxTokens": 64000,
+                },
+            ],
         }
 
         existing_config["models"]["providers"]["emergent-gpt"] = emergent_gpt_provider
@@ -550,7 +587,7 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         existing_config["agents"]["defaults"]["models"] = {
             "emergent-gpt/gpt-5.2": {"alias": "gpt-5.2"},
             "emergent-claude/claude-sonnet-4-6": {"alias": "sonnet"},
-            "emergent-claude/claude-opus-4-6": {"alias": "opus"}
+            "emergent-claude/claude-opus-4-6": {"alias": "opus"},
         }
         existing_config["agents"]["defaults"]["model"] = {
             "primary": "emergent-claude/claude-opus-4-6"
@@ -572,47 +609,37 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
                         "input": 0.00000175,
                         "output": 0.000014,
                         "cacheRead": 0.000000175,
-                        "cacheWrite": 0.00000175
+                        "cacheWrite": 0.00000175,
                     },
                     "contextWindow": 400000,
-                    "maxTokens": 128000
+                    "maxTokens": 128000,
                 },
                 {
                     "id": "o4-mini-2025-04-16",
                     "name": "o4-mini",
                     "reasoning": True,
                     "input": ["text", "image"],
-                    "cost": {
-                        "input": 0.0000011,
-                        "output": 0.0000044
-                    },
+                    "cost": {"input": 0.0000011, "output": 0.0000044},
                     "contextWindow": 200000,
-                    "maxTokens": 100000
+                    "maxTokens": 100000,
                 },
                 {
                     "id": "gpt-4o",
                     "name": "GPT-4o",
                     "reasoning": False,
                     "input": ["text", "image"],
-                    "cost": {
-                        "input": 0.0000025,
-                        "output": 0.00001
-                    },
+                    "cost": {"input": 0.0000025, "output": 0.00001},
                     "contextWindow": 128000,
-                    "maxTokens": 16384
-                }
-            ]
+                    "maxTokens": 16384,
+                },
+            ],
         }
 
         existing_config["models"]["providers"]["openai"] = openai_provider
 
         # Set primary model to GPT-5.2
-        existing_config["agents"]["defaults"]["models"] = {
-            "openai/gpt-5.2": {"alias": "gpt-5.2"}
-        }
-        existing_config["agents"]["defaults"]["model"] = {
-            "primary": "openai/gpt-5.2"
-        }
+        existing_config["agents"]["defaults"]["models"] = {"openai/gpt-5.2": {"alias": "gpt-5.2"}}
+        existing_config["agents"]["defaults"]["model"] = {"primary": "openai/gpt-5.2"}
 
     elif provider == "anthropic":
         # Direct Anthropic API with user's own key
@@ -625,11 +652,16 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
                     "id": "claude-opus-4-5-20251101",
                     "name": "Claude Opus 4.5",
                     "input": ["text", "image"],
-                    "cost": {"input": 0.000015, "output": 0.000075, "cacheRead": 0.0000015, "cacheWrite": 0.00001875},
+                    "cost": {
+                        "input": 0.000015,
+                        "output": 0.000075,
+                        "cacheRead": 0.0000015,
+                        "cacheWrite": 0.00001875,
+                    },
                     "contextWindow": 200000,
-                    "maxTokens": 64000
+                    "maxTokens": 64000,
                 }
-            ]
+            ],
         }
 
         existing_config["models"]["providers"]["anthropic"] = anthropic_provider
@@ -660,7 +692,7 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str)
         # Recover token from config
         token = None
         try:
-            with open(CONFIG_FILE, 'r') as f:
+            with open(CONFIG_FILE, "r") as f:
                 config = json.load(f)
             token = config.get("gateway", {}).get("auth", {}).get("token")
         except:
@@ -668,7 +700,9 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str)
 
         if not token:
             token = generate_token()
-            create_moltbot_config(token=token, api_key=api_key, provider=provider, force_new_token=True)
+            create_moltbot_config(
+                token=token, api_key=api_key, provider=provider, force_new_token=True
+            )
 
         gateway_state["token"] = token
         gateway_state["provider"] = provider
@@ -685,10 +719,10 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str)
                     "provider": provider,
                     "token": token,
                     "started_at": gateway_state["started_at"],
-                    "updated_at": datetime.now(timezone.utc)
+                    "updated_at": datetime.now(timezone.utc),
                 }
             },
-            upsert=True
+            upsert=True,
         )
 
         return token
@@ -697,10 +731,14 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str)
     openclaw_cmd = get_openclaw_command()
     if not openclaw_cmd:
         if not ensure_moltbot_installed():
-            raise HTTPException(status_code=500, detail="OpenClaw is not installed. Please contact support.")
+            raise HTTPException(
+                status_code=500, detail="OpenClaw is not installed. Please contact support."
+            )
         openclaw_cmd = get_openclaw_command()
         if not openclaw_cmd:
-            raise HTTPException(status_code=500, detail="Failed to find openclaw after installation")
+            raise HTTPException(
+                status_code=500, detail="Failed to find openclaw after installation"
+            )
 
     # Create config (reuses existing token to avoid gateway restarts)
     token = create_moltbot_config(api_key=api_key, provider=provider)
@@ -742,10 +780,10 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str)
                                 "provider": provider,
                                 "token": token,
                                 "started_at": gateway_state["started_at"],
-                                "updated_at": datetime.now(timezone.utc)
+                                "updated_at": datetime.now(timezone.utc),
                             }
                         },
-                        upsert=True
+                        upsert=True,
                     )
 
                     return token
@@ -767,32 +805,42 @@ def check_gateway_running():
 
 # ============== Moltbot API Endpoints (Protected) ==============
 
+
 @api_router.get("/")
 async def root():
     return {"message": "OpenClaw Hosting API"}
 
 
 @api_router.post("/openclaw/start", response_model=OpenClawStartResponse)
-async def start_moltbot(request: OpenClawStartRequest, req: Request):
+@limiter.limit("5/minute")
+async def start_moltbot(request: Request, body: OpenClawStartRequest):
     """Start the Moltbot gateway with Emergent provider (requires auth)"""
-    user = await require_auth(req)
+    user = await require_auth(request)
 
-    if request.provider not in ["emergent", "anthropic", "openai"]:
-        raise HTTPException(status_code=400, detail="Invalid provider. Use 'emergent', 'anthropic', or 'openai'")
+    if body.provider not in ["emergent", "anthropic", "openai"]:
+        raise HTTPException(
+            status_code=400, detail="Invalid provider. Use 'emergent', 'anthropic', or 'openai'"
+        )
 
     # For non-emergent providers, API key is required
-    if request.provider in ["anthropic", "openai"] and (not request.apiKey or len(request.apiKey) < 10):
-        raise HTTPException(status_code=400, detail="API key required for anthropic/openai providers")
+    if body.provider in ["anthropic", "openai"] and (not body.apiKey or len(body.apiKey) < 10):
+        raise HTTPException(
+            status_code=400, detail="API key required for anthropic/openai providers"
+        )
 
     # Check if Moltbot is already running by another user
-    if check_gateway_running() and gateway_state["owner_user_id"] is not None and gateway_state["owner_user_id"] != user.user_id:
+    if (
+        check_gateway_running()
+        and gateway_state["owner_user_id"] is not None
+        and gateway_state["owner_user_id"] != user.user_id
+    ):
         raise HTTPException(
             status_code=403,
-            detail="OpenClaw is already running by another user. Please wait for them to stop it."
+            detail="OpenClaw is already running by another user. Please wait for them to stop it.",
         )
 
     try:
-        token = await start_gateway_process(request.apiKey, request.provider, user.user_id)
+        token = await start_gateway_process(body.apiKey, body.provider, user.user_id)
 
         # Lock the instance to this user on first successful start
         await set_instance_owner(user)
@@ -802,7 +850,7 @@ async def start_moltbot(request: OpenClawStartRequest, req: Request):
             ok=True,
             controlUrl="/api/openclaw/ui/",
             token=token,
-            message="OpenClaw started successfully with Emergent provider"
+            message="OpenClaw started successfully with Emergent provider",
         )
     except HTTPException:
         raise
@@ -818,7 +866,9 @@ async def get_moltbot_status(request: Request):
     running = check_gateway_running()
 
     if running:
-        is_owner = user and (gateway_state["owner_user_id"] is None or gateway_state["owner_user_id"] == user.user_id)
+        is_owner = user and (
+            gateway_state["owner_user_id"] is None or gateway_state["owner_user_id"] == user.user_id
+        )
         return OpenClawStatusResponse(
             running=True,
             pid=SupervisorClient.get_pid(),
@@ -826,7 +876,7 @@ async def get_moltbot_status(request: Request):
             started_at=gateway_state["started_at"],
             controlUrl="/api/openclaw/ui/",
             owner_user_id=gateway_state["owner_user_id"],
-            is_owner=is_owner
+            is_owner=is_owner,
         )
     else:
         return OpenClawStatusResponse(running=False)
@@ -849,12 +899,15 @@ async def stop_moltbot(request: Request):
         # Clear should_run flag even if not running
         await db.moltbot_configs.update_one(
             {"_id": "gateway_config"},
-            {"$set": {"should_run": False, "updated_at": datetime.now(timezone.utc)}}
+            {"$set": {"should_run": False, "updated_at": datetime.now(timezone.utc)}},
         )
         return {"ok": True, "message": "OpenClaw is not running"}
 
     # Check if user is the owner
-    if gateway_state["owner_user_id"] is not None and gateway_state["owner_user_id"] != user.user_id:
+    if (
+        gateway_state["owner_user_id"] is not None
+        and gateway_state["owner_user_id"] != user.user_id
+    ):
         raise HTTPException(status_code=403, detail="Only the owner can stop OpenClaw")
 
     # Stop via supervisor
@@ -867,7 +920,7 @@ async def stop_moltbot(request: Request):
     # Clear should_run flag in database
     await db.moltbot_configs.update_one(
         {"_id": "gateway_config"},
-        {"$set": {"should_run": False, "updated_at": datetime.now(timezone.utc)}}
+        {"$set": {"should_run": False, "updated_at": datetime.now(timezone.utc)}},
     )
 
     # Clear in-memory state
@@ -888,7 +941,10 @@ async def get_moltbot_token(request: Request):
         raise HTTPException(status_code=404, detail="OpenClaw not running")
 
     # Only owner can get the token
-    if gateway_state["owner_user_id"] is not None and gateway_state["owner_user_id"] != user.user_id:
+    if (
+        gateway_state["owner_user_id"] is not None
+        and gateway_state["owner_user_id"] != user.user_id
+    ):
         raise HTTPException(status_code=403, detail="Only the owner can access the token")
 
     return {"token": gateway_state.get("token")}
@@ -896,7 +952,10 @@ async def get_moltbot_token(request: Request):
 
 # ============== Moltbot Proxy (Protected) ==============
 
-@api_router.api_route("/openclaw/ui/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+
+@api_router.api_route(
+    "/openclaw/ui/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
+)
 async def proxy_moltbot_ui(request: Request, path: str = ""):
     """Proxy requests to the Moltbot Control UI (only owner can access)"""
     user = await get_current_user(request)
@@ -904,14 +963,17 @@ async def proxy_moltbot_ui(request: Request, path: str = ""):
     if not check_gateway_running():
         return HTMLResponse(
             content="<html><body><h1>OpenClaw not running</h1><p>Please start OpenClaw first.</p><a href='/'>Go to setup</a></body></html>",
-            status_code=503
+            status_code=503,
         )
 
     # Check if user is the owner
-    if not user or (gateway_state["owner_user_id"] is not None and gateway_state["owner_user_id"] != user.user_id):
+    if not user or (
+        gateway_state["owner_user_id"] is not None
+        and gateway_state["owner_user_id"] != user.user_id
+    ):
         return HTMLResponse(
             content="<html><body><h1>Access Denied</h1><p>This OpenClaw instance is owned by another user.</p><a href='/'>Go back</a></body></html>",
-            status_code=403
+            status_code=403,
         )
 
     target_url = f"http://127.0.0.1:{MOLTBOT_PORT}/{path}"
@@ -930,18 +992,18 @@ async def proxy_moltbot_ui(request: Request, path: str = ""):
             body = await request.body()
 
             response = await client.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                content=body,
-                timeout=30.0
+                method=request.method, url=target_url, headers=headers, content=body, timeout=30.0
             )
 
             # Filter response headers
-            exclude_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+            exclude_headers = {
+                "content-encoding",
+                "content-length",
+                "transfer-encoding",
+                "connection",
+            }
             response_headers = {
-                k: v for k, v in response.headers.items()
-                if k.lower() not in exclude_headers
+                k: v for k, v in response.headers.items() if k.lower() not in exclude_headers
             }
 
             # Get content and rewrite WebSocket URLs if HTML
@@ -953,9 +1015,9 @@ async def proxy_moltbot_ui(request: Request, path: str = ""):
 
             # If it's HTML, rewrite any WebSocket URLs to use our proxy
             if "text/html" in content_type:
-                content_str = content.decode('utf-8', errors='ignore')
+                content_str = content.decode("utf-8", errors="ignore")
                 # Inject WebSocket URL override script with token
-                ws_override = f'''
+                ws_override = f"""
 <script>
 // OpenClaw Proxy Configuration
 window.__MOLTBOT_PROXY_TOKEN__ = "{current_token}";
@@ -997,21 +1059,21 @@ window.__MOLTBOT_PROXY_WS_URL__ = (window.location.protocol === 'https:' ? 'wss:
     window.WebSocket.CLOSED = originalWS.CLOSED;
 }})();
 </script>
-'''
+"""
                 # Insert before </head> or at start of <body>
-                if '</head>' in content_str:
-                    content_str = content_str.replace('</head>', ws_override + '</head>')
-                elif '<body>' in content_str:
-                    content_str = content_str.replace('<body>', '<body>' + ws_override)
+                if "</head>" in content_str:
+                    content_str = content_str.replace("</head>", ws_override + "</head>")
+                elif "<body>" in content_str:
+                    content_str = content_str.replace("<body>", "<body>" + ws_override)
                 else:
                     content_str = ws_override + content_str
-                content = content_str.encode('utf-8')
+                content = content_str.encode("utf-8")
 
             return Response(
                 content=content,
                 status_code=response.status_code,
                 headers=response_headers,
-                media_type=response.headers.get("content-type")
+                media_type=response.headers.get("content-type"),
             )
         except httpx.RequestError as e:
             logger.error(f"Proxy error: {e}")
@@ -1022,10 +1084,7 @@ window.__MOLTBOT_PROXY_WS_URL__ = (window.location.protocol === 'https:' ? 'wss:
 @api_router.get("/openclaw/ui")
 async def proxy_moltbot_ui_root(request: Request):
     """Redirect to Moltbot UI with trailing slash"""
-    return Response(
-        status_code=307,
-        headers={"Location": "/api/openclaw/ui/"}
-    )
+    return Response(status_code=307, headers={"Location": "/api/openclaw/ui/"})
 
 
 # WebSocket proxy for Moltbot (Protected)
@@ -1061,7 +1120,7 @@ async def websocket_proxy(websocket: WebSocket):
             ping_timeout=20,
             close_timeout=10,
             additional_headers=extra_headers if extra_headers else None,
-            origin=f"http://127.0.0.1:{MOLTBOT_PORT}"
+            origin=f"http://127.0.0.1:{MOLTBOT_PORT}",
         ) as moltbot_ws:
 
             async def client_to_moltbot():
@@ -1098,9 +1157,9 @@ async def websocket_proxy(websocket: WebSocket):
             done, pending = await asyncio.wait(
                 [
                     asyncio.create_task(client_to_moltbot()),
-                    asyncio.create_task(moltbot_to_client())
+                    asyncio.create_task(moltbot_to_client()),
                 ],
-                return_when=asyncio.FIRST_COMPLETED
+                return_when=asyncio.FIRST_COMPLETED,
             )
 
             # Cancel pending tasks
@@ -1117,7 +1176,27 @@ async def websocket_proxy(websocket: WebSocket):
             pass
 
 
+# ============== Health Check ==============
+
+
+@api_router.get("/health", tags=["ops"])
+async def health_check():
+    """Liveness + readiness probe. Returns 200 if the API and DB are reachable."""
+    try:
+        await db.command("ping")
+        db_status = "connected"
+    except Exception as exc:
+        logger.error(f"Health check DB error: {exc}")
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {
+        "status": "ok",
+        "db": db_status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # ============== Legacy Status Endpoints ==============
+
 
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
@@ -1125,7 +1204,7 @@ async def create_status_check(input: StatusCheckCreate):
     status_obj = StatusCheck(**status_dict)
 
     doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
+    doc["timestamp"] = doc["timestamp"].isoformat()
 
     _ = await db.status_checks.insert_one(doc)
     return status_obj
@@ -1136,26 +1215,67 @@ async def get_status_checks():
     status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
 
     for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
+        if isinstance(check["timestamp"], str):
+            check["timestamp"] = datetime.fromisoformat(check["timestamp"])
 
     return status_checks
+
+
+# ============== Middleware ==============
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to every response."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("X-XSS-Protection", "1; mode=block")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(
+            "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
+        )
+        if os.environ.get("ENVIRONMENT", "development") == "production":
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                "max-age=31536000; includeSubDomains",
+            )
+        return response
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Attach a unique request-ID to every request for correlation logging."""
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
 
 
 # Include the router in the main app
 app.include_router(api_router)
 
+# Middleware registration order matters: last added = outermost layer
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=[
+        o.strip()
+        for o in os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
+        if o.strip()
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestIDMiddleware)
 
 
 # Background task for auto-fixing WhatsApp
 whatsapp_watcher_task = None
+
 
 async def whatsapp_auto_fix_watcher():
     """Auto-fix Baileys registered=false bug every 5 seconds."""
@@ -1164,13 +1284,23 @@ async def whatsapp_auto_fix_watcher():
         await asyncio.sleep(5)
         try:
             status = get_whatsapp_status()
-            logger.info(f"[whatsapp-watcher] Check: linked={status['linked']}, registered={status['registered']}, phone={status['phone']}")
+            logger.info(
+                f"[whatsapp-watcher] Check: linked={status['linked']}, registered={status['registered']}, phone={status['phone']}"
+            )
             if status["linked"] and not status["registered"]:
                 logger.info("[whatsapp-watcher] DETECTED registered=false, applying fix...")
                 if fix_registered_flag():
-                    logger.info("[whatsapp-watcher] Fix applied, restarting gateway via supervisor...")
-                    result = subprocess.run(["supervisorctl", "restart", "openclaw-gateway"], capture_output=True, text=True)
-                    logger.info(f"[whatsapp-watcher] Supervisor restart result: {result.stdout} {result.stderr}")
+                    logger.info(
+                        "[whatsapp-watcher] Fix applied, restarting gateway via supervisor..."
+                    )
+                    result = subprocess.run(
+                        ["supervisorctl", "restart", "openclaw-gateway"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    logger.info(
+                        f"[whatsapp-watcher] Supervisor restart result: {result.stdout} {result.stderr}"
+                    )
         except Exception as e:
             logger.warning(f"[whatsapp-watcher] Error: {e}")
 
@@ -1198,13 +1328,15 @@ async def _deferred_gateway_starter(config_doc):
                 return
             openclaw_cmd = get_openclaw_command()
         if not openclaw_cmd:
-            logger.error("[deferred-start] Cannot start gateway: OpenClaw not available after install")
+            logger.error(
+                "[deferred-start] Cannot start gateway: OpenClaw not available after install"
+            )
             return
         # Read token from config file or database
         token = config_doc.get("token")
         if not token:
             try:
-                with open(CONFIG_FILE, 'r') as f:
+                with open(CONFIG_FILE, "r") as f:
                     config = json.load(f)
                 token = config.get("gateway", {}).get("auth", {}).get("token")
             except Exception:
@@ -1223,12 +1355,28 @@ async def _deferred_gateway_starter(config_doc):
     logger.warning("[deferred-start] Config file never appeared after 5 minutes, giving up")
 
 
-@app.on_event("startup")
 async def startup_event():
     """Run on server startup - ensure Moltbot dependencies are installed and auto-start gateway if needed"""
     global whatsapp_watcher_task, gateway_state
 
     logger.info("Server starting up...")
+
+    # ---- Ensure MongoDB indexes ----
+    try:
+        # users: unique email
+        await db.users.create_index("email", unique=True, background=True)
+        # user_sessions: fast token lookup + TTL expiry
+        await db.user_sessions.create_index("session_token", unique=True, background=True)
+        await db.user_sessions.create_index(
+            "expires_at",
+            expireAfterSeconds=0,  # TTL index: let MongoDB auto-purge expired sessions
+            background=True,
+        )
+        # status_checks: recency ordering
+        await db.status_checks.create_index([("timestamp", -1)], background=True)
+        logger.info("MongoDB indexes ensured")
+    except Exception as exc:
+        logger.warning(f"Index creation warning (non-fatal): {exc}")
 
     # Reload supervisor config to pick up any changes
     SupervisorClient.reload_config()
@@ -1255,11 +1403,13 @@ async def startup_event():
         pid = SupervisorClient.get_pid()
         logger.info(f"Gateway already running via supervisor (PID: {pid})")
 
-        gateway_state["provider"] = config_doc.get("provider", "emergent") if config_doc else "emergent"
+        gateway_state["provider"] = (
+            config_doc.get("provider", "emergent") if config_doc else "emergent"
+        )
 
         # Recover token from config file
         try:
-            with open(CONFIG_FILE, 'r') as f:
+            with open(CONFIG_FILE, "r") as f:
                 config = json.load(f)
             gateway_state["token"] = config.get("gateway", {}).get("auth", {}).get("token")
             logger.info("Recovered gateway token from config file")
@@ -1278,7 +1428,9 @@ async def startup_event():
 
         # Check if config directory has content (may still be pending transfer on StatefulSet pods)
         if not os.path.exists(CONFIG_FILE):
-            logger.info(f"Config file {CONFIG_FILE} not found yet - deferring auto-start (transfer may be pending)")
+            logger.info(
+                f"Config file {CONFIG_FILE} not found yet - deferring auto-start (transfer may be pending)"
+            )
             asyncio.create_task(_deferred_gateway_starter(config_doc))
         else:
             # Ensure openclaw binary is available before starting
@@ -1288,13 +1440,15 @@ async def startup_event():
                 openclaw_cmd = get_openclaw_command()
 
             if not openclaw_cmd:
-                logger.error("Cannot auto-start gateway: OpenClaw binary not available after install attempt")
+                logger.error(
+                    "Cannot auto-start gateway: OpenClaw binary not available after install attempt"
+                )
             else:
                 # Recover token from config file or database
                 token = config_doc.get("token")
                 if not token:
                     try:
-                        with open(CONFIG_FILE, 'r') as f:
+                        with open(CONFIG_FILE, "r") as f:
                             config = json.load(f)
                         token = config.get("gateway", {}).get("auth", {}).get("token")
                     except:
@@ -1322,7 +1476,6 @@ async def startup_event():
     logger.info("[whatsapp-watcher] Background watcher task created (checks every 5s)")
 
 
-@app.on_event("shutdown")
 async def shutdown_db_client():
     global whatsapp_watcher_task
 

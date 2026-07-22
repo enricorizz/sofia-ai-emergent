@@ -1,0 +1,87 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sofia AI Emergent – Docker Compose (local development & staging)
+#
+# Usage:
+#   cp .env.example .env          # fill in real values
+#   docker compose up --build
+#
+# Services:
+#   backend   – FastAPI on :8001
+#   frontend  – React/nginx on :3000 (proxies /api/* → backend)
+#   mongo     – MongoDB on :27017 (local only, not exposed in prod)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+version: "3.9"
+
+services:
+  # ── MongoDB ──────────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7.0
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: moltbot_app
+    # Only expose to host in dev; remove in production
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── Backend (FastAPI) ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    ports:
+      - "8001:8001"
+    volumes:
+      # Mount backend source for live-reload in dev; remove in prod
+      - ./backend:/app/backend:ro
+      # Persist openclaw config across restarts
+      - openclaw_config:/root/.openclaw
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8001/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Frontend (React + nginx) ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        REACT_APP_BACKEND_URL: ""   # empty = same-origin proxy via nginx
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  mongo_data:
+  openclaw_config:

@@ -1,0 +1,36 @@
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | __pycache__
+  | node_modules
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["backend"]
+
+[tool.flake8]
+# flake8 doesn't support pyproject.toml natively; use setup.cfg instead.
+# See setup.cfg for flake8 config.
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+strict = false
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+filterwarnings = [
+    "ignore::DeprecationWarning:fastapi",
+    "ignore::PendingDeprecationWarning",
+]
