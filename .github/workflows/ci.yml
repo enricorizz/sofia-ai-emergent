@@ -6,7 +6,6 @@
 #   backend-test   – pytest unit tests (no real MongoDB required)
 #   frontend-lint  – ESLint
 #   frontend-build – yarn build (smoke-test the React build)
-#   docker-build   – docker compose build (image smoke-test)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 name: CI
@@ -17,11 +16,17 @@ on:
   pull_request:
     branches: ["**"]
 
+# Principle of least privilege: all jobs get read-only access by default.
+permissions:
+  contents: read
+
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
   backend-lint:
     name: Backend – Lint (black / isort / flake8)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -40,11 +45,9 @@ jobs:
 
       - name: black – format check
         run: black --check --diff backend/
-        continue-on-error: false
 
       - name: isort – import order check
         run: isort --check-only --diff backend/
-        continue-on-error: false
 
       - name: flake8 – style check
         run: flake8 backend/
@@ -53,6 +56,8 @@ jobs:
   backend-test:
     name: Backend – Tests (pytest)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     env:
       MONGO_URL: mongodb://localhost:27017
@@ -74,7 +79,8 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r backend/requirements.txt
+          # Skip emergentintegrations (proprietary, not on PyPI)
+          grep -v "emergentintegrations" backend/requirements.txt | pip install -r /dev/stdin
 
       - name: Run tests
         run: pytest tests/ -v --tb=short
@@ -83,6 +89,8 @@ jobs:
   frontend-lint:
     name: Frontend – ESLint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     defaults:
       run:
@@ -102,14 +110,17 @@ jobs:
         run: yarn install --frozen-lockfile
 
       - name: ESLint
-        run: yarn eslint src/ --max-warnings 0 || true
-        # `|| true` keeps CI green while legacy warnings exist;
-        # remove once all warnings are resolved.
+        # continue-on-error keeps the pipeline green while resolving legacy warnings,
+        # but the annotation is still visible in the PR checks.
+        continue-on-error: true
+        run: yarn eslint src/ --max-warnings 0
 
   # ────────────────────────────────────────────────────────────────────────────
   frontend-build:
     name: Frontend – Build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     defaults:
       run:
@@ -117,7 +128,7 @@ jobs:
 
     env:
       REACT_APP_BACKEND_URL: ""
-      # Disable treating warnings as errors during build
+      # Disable treating warnings as errors during CRA build
       CI: false
 
     steps:

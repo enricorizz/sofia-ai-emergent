@@ -53,14 +53,14 @@ limiter = Limiter(key_func=get_remote_address)
 
 
 @asynccontextmanager
-async def lifespan(application):  # noqa: ARG001
+async def lifespan(_app):  # _app: FastAPI; unused but required by lifespan protocol
     """Startup / shutdown handler (modern replacement for on_event).
-    startup_event and shutdown_db_client are defined lower in this file;
-    Python resolves them at call-time so the forward reference is safe.
+    startup_event and shutdown_db_client are defined later in this file;
+    Python resolves module globals at call-time so the forward reference is safe.
     """
-    await startup_event()  # type: ignore[name-defined]
+    await startup_event()
     yield
-    await shutdown_db_client()  # type: ignore[name-defined]
+    await shutdown_db_client()
 
 
 # Create the main app without a prefix
