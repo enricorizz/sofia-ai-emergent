@@ -5,8 +5,8 @@ This module provides a clean interface for starting, stopping, and
 checking the status of the gateway process managed by supervisord.
 """
 
-import subprocess
 import logging
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +26,7 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'start', cls.PROGRAM],
-                capture_output=True,
-                text=True,
-                timeout=30
+                ["supervisorctl", "start", cls.PROGRAM], capture_output=True, text=True, timeout=30
             )
             if result.returncode == 0:
                 logger.info(f"Started {cls.PROGRAM} via supervisor")
@@ -56,12 +53,9 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'stop', cls.PROGRAM],
-                capture_output=True,
-                text=True,
-                timeout=30
+                ["supervisorctl", "stop", cls.PROGRAM], capture_output=True, text=True, timeout=30
             )
-            if result.returncode == 0 or 'NOT RUNNING' in result.stdout:
+            if result.returncode == 0 or "NOT RUNNING" in result.stdout:
                 logger.info(f"Stopped {cls.PROGRAM} via supervisor")
                 return True
             else:
@@ -84,14 +78,11 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'status', cls.PROGRAM],
-                capture_output=True,
-                text=True,
-                timeout=10
+                ["supervisorctl", "status", cls.PROGRAM], capture_output=True, text=True, timeout=10
             )
             # Check for RUNNING state in output
             # Output format: "openclaw-gateway            RUNNING   pid 12345, uptime 0:01:23"
-            return 'RUNNING' in result.stdout
+            return "RUNNING" in result.stdout
         except Exception as e:
             logger.error(f"Error checking {cls.PROGRAM} status: {e}")
             return False
@@ -106,17 +97,14 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'status', cls.PROGRAM],
-                capture_output=True,
-                text=True,
-                timeout=10
+                ["supervisorctl", "status", cls.PROGRAM], capture_output=True, text=True, timeout=10
             )
             # Parse PID from output like: "openclaw-gateway            RUNNING   pid 12345, uptime 0:01:23"
-            if 'RUNNING' in result.stdout and 'pid' in result.stdout:
+            if "RUNNING" in result.stdout and "pid" in result.stdout:
                 # Extract pid number
-                parts = result.stdout.split('pid')
+                parts = result.stdout.split("pid")
                 if len(parts) > 1:
-                    pid_part = parts[1].strip().split(',')[0].strip()
+                    pid_part = parts[1].strip().split(",")[0].strip()
                     return int(pid_part)
             return None
         except Exception as e:
@@ -133,10 +121,10 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'restart', cls.PROGRAM],
+                ["supervisorctl", "restart", cls.PROGRAM],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
             )
             if result.returncode == 0:
                 logger.info(f"Restarted {cls.PROGRAM} via supervisor")
@@ -163,20 +151,14 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'reread'],
-                capture_output=True,
-                text=True,
-                timeout=10
+                ["supervisorctl", "reread"], capture_output=True, text=True, timeout=10
             )
             if result.returncode != 0:
                 logger.error(f"Failed to reread supervisor config: {result.stderr}")
                 return False
 
             result = subprocess.run(
-                ['supervisorctl', 'update'],
-                capture_output=True,
-                text=True,
-                timeout=10
+                ["supervisorctl", "update"], capture_output=True, text=True, timeout=10
             )
             if result.returncode != 0:
                 logger.error(f"Failed to update supervisor: {result.stderr}")
